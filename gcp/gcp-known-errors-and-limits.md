@@ -110,23 +110,7 @@ googleapi: Error 400: Invalid resource usage: 'Disk cannot be resized while ther
 
 ---
 
-## 6. Snapshot Name Conflict (409 Already Exists)
-
-**Error:**
-
-```
-googleapi: Error 409: The resource 'projects/<project>/global/snapshots/snapshot-<id>' already exists, alreadyExists
-```
-
-**When it occurs:** A snapshot creation is retried (e.g. after a timeout) while the original snapshot is still being created in GCP.
-
-**Impact:** Snapshot creation fails. Downstream operations that depend on the snapshot (restores, clones) are blocked.
-
-**Mitigation:** This is typically a transient issue. Retrying after the in-flight snapshot completes usually resolves it. If persistent, delete the orphaned snapshot and recreate.
-
----
-
-## 7. No Native RWX Filesystem Support
+## 6. No Native RWX Filesystem Support
 
 **Symptom:** Operations requiring ReadWriteMany (RWX) Filesystem PVCs fail because GCP PD only provides ReadWriteOnce (RWO).
 
@@ -135,46 +119,6 @@ googleapi: Error 409: The resource 'projects/<project>/global/snapshots/snapshot
 **Impact:** Features like CBT across live migration are not available without an additional RWX-capable storage provider.
 
 **Mitigation:** Deploy a separate RWX Filesystem storage solution (e.g. GCP Filestore CSI, NFS) alongside GCP PD for features that require it.
-
----
-
-## 8. Size Rounding and Filesystem Overhead
-
-**Symptom:** Actual usable disk size differs from requested size. For example, a 4 Gi Filesystem PVC provides only ~3.2 GiB of usable space.
-
-**When it occurs:** Any Filesystem-mode PVC on Hyperdisk Balanced. GCP PD also rounds up requested sizes to its own size tiers (e.g. 1 Gi to 4 Gi, 6 Gi to 8 Gi).
-
-**Impact:**
-
-- Block-to-Filesystem storage migrations can fail at the 4 Gi boundary: a 4 Gi block device (4,294,967,296 bytes) does not fit in a 4 Gi Filesystem PVC (~3,438,280,704 bytes usable after ext4 overhead).
-- Tools like `lsblk` report usable size (~3.2 G), not nominal size (4 G), which can cause confusion.
-
-**Details:**
-
-| Requested | Actual PVC | Usable (Filesystem) | Overhead |
-|-----------|-----------|---------------------|----------|
-| 1 Gi | 4 Gi (minimum) | ~3.2 GiB | ~19% |
-| 4 Gi | 4 Gi | ~3.2 GiB | ~19% |
-| 5 Gi | 6 Gi | ~5.6 GiB | ~7% |
-| 8 Gi | 8 Gi | ~7.6 GiB | ~5% |
-
-**Mitigation:** Always account for filesystem overhead when sizing PVCs, especially at boundaries near the minimum size. For block-to-filesystem migrations, the destination PVC should be larger than the source block PVC.
-
----
-
-## 9. API Throttling During Bulk Operations
-
-**Symptom:**
-
-```
-"Waited before sending request" delay="N.Ns" reason="client-side throttling, not priority and fairness"
-```
-
-**When it occurs:** Bulk volume operations such as creating many DataVolumes or PVCs simultaneously.
-
-**Impact:** API request delays escalate (observed: 1 s, 4.75 s, 8.55 s), slowing down status polling and causing operations to miss their timeouts.
-
-**Mitigation:** Reduce the burst rate of bulk operations. Stagger volume creation rather than submitting all requests simultaneously.
 
 ---
 
@@ -188,4 +132,3 @@ googleapi: Error 409: The resource 'projects/<project>/global/snapshots/snapshot
 | Storage pool throughput overprovisioning | Pool-defined limit | PVC creation fails when pool throughput exceeded |
 | Disk resize rate limit | 1 resize at a time per disk | Concurrent/rapid resizes fail |
 | RWX Filesystem support | Not available (RWO only) | Features requiring RWX FS need separate storage |
-| Filesystem overhead at 4 Gi | ~19% (~3.2 GiB usable) | Block-to-FS migration fails at minimum boundary |
