@@ -100,9 +100,9 @@ For implementation details, see [containerized-data-importer PR #3991](https://g
   ```
   You should see `snapshot-type: images`.
 
-- After golden images are imported, check that snapshots use `csi-gce-pd-vsc-images`:
+- After golden images are imported, check that snapshots in the golden images namespace (e.g. `openshift-virtualization-os-images`) use `csi-gce-pd-vsc-images`:
   ```bash
-  oc get volumesnapshot --all-namespaces -o yaml | grep csi-gce-pd-vsc-images
+  oc get volumesnapshot -n openshift-virtualization-os-images -o yaml | grep csi-gce-pd-vsc-images
   ```
 
 ## Summary

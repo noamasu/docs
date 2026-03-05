@@ -16,11 +16,16 @@ googleapi: Error 400: Disk size cannot be smaller than 4 GB for disk type hyperd
 
 **Impact:** PVC stays in `Pending` state indefinitely. VMs that depend on the PVC will not start.
 
-**Mitigation:** Always request at least 4 Gi, or use the `cdi.kubevirt.io/applyStorageProfile` label on PVCs so that CDI's StorageProfile `minimumSupportedPvcSize: 4Gi` auto-adjusts the size.
+**Mitigation:** Always request at least 4 Gi. CDI's StorageProfile sets `minimumSupportedPvcSize: 4Gi` to handle this automatically, but the behavior depends on how the DataVolume is defined:
+
+- **DataVolume with `storage`:** CDI applies the StorageProfile automatically. Requesting less than 4 Gi (e.g. 1 Gi) will result in a 4 Gi PVC.
+- **DataVolume with `pvc`:** CDI does not apply the StorageProfile by default. To enable automatic size adjustment, add the label `cdi.kubevirt.io/applyStorageProfile: "true"` to the PVC.
+
+For full details on Hyperdisk Balanced size and performance limits, see [Hyperdisk Balanced size limits](https://docs.cloud.google.com/compute/docs/disks/hd-types/hyperdisk-balanced#size_limits).
 
 ---
 
-## 2. Volume Attachment Limit Per Node (15 volumes)
+## 2. Volume Attachment Limit Per Node
 
 **Error:**
 
@@ -28,17 +33,33 @@ googleapi: Error 400: Disk size cannot be smaller than 4 GB for disk type hyperd
 FailedScheduling: 0/N nodes are available: 1 node(s) exceed max volume count
 ```
 
-**When it occurs:** Attaching more than ~15 Hyperdisk Balanced volumes to a single node. The CSI driver reports `allocatable.count: 15` on worker nodes.
+**When it occurs:** Attaching more volumes than the machine type allows. The GCP PD CSI driver reports `MaxVolumesPerNode` to Kubernetes via the `CSINode` object.
 
 **Impact:** Pods requiring additional volume attachments beyond the limit cannot be scheduled. Hotplug operations stall at `AttachedToNode` and never transition to `Ready`.
 
-**Details:** This limit is reported by the GCP PD CSI driver in the `CSINode` object:
+**Details:** Most machine types default to **127** volumes per node. Some bare metal types have lower fixed limits, and `c3-metal` in particular defaults to only **15**. To raise `c3-metal` to 128, your GCP project must first be allowlisted by Google (project-level approval). Once allowlisted, apply the override label to all worker nodes (see below). For the full breakdown by machine type, see [GCP C3 disk and capacity limits](https://docs.cloud.google.com/compute/docs/general-purpose-machines#disk_and_capacity_limits_8).
+
+**How to check the current limit on a node:**
 
 ```bash
 oc get csinode <node-name> -o jsonpath='{.spec.drivers[?(@.name=="pd.csi.storage.gke.io")].allocatable.count}'
 ```
 
-**Mitigation:** Spread volumes across multiple nodes. For workloads requiring many volumes per node, investigate increasing the attachment limit via node labels (see [volume attachment limit override](https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/gce-pd-csi-driver#volume_limit)).
+**Mitigation:** Spread volumes across multiple nodes, or override the limit by labeling worker nodes:
+
+```bash
+oc label nodes <worker-1> <worker-2> <worker-3> node-restriction.kubernetes.io/gke-volume-attach-limit-override=127 --overwrite
+```
+
+After applying the label, restart the CSI driver node pods for the new limit to take effect:
+
+```bash
+oc delete pod -n openshift-cluster-csi-drivers -l app=gcp-pd-csi-driver-node
+```
+
+The valid override range is 1-127. For a full step-by-step override procedure (including required RBAC and CSI driver image changes), see [GCP PD CSI Volume Attachment Limit Override](gcp-volume-attachment-limit-override.md).
+
+> **Note:** The node boot disk is considered an attachable disk, so the effective usable limit is one less than the reported value.
 
 ---
 
@@ -112,13 +133,13 @@ googleapi: Error 400: Invalid resource usage: 'Disk cannot be resized while ther
 
 ## 6. No Native RWX Filesystem Support
 
-**Symptom:** Operations requiring ReadWriteMany (RWX) Filesystem PVCs fail because GCP PD only provides ReadWriteOnce (RWO).
+**Symptom:** GCP PD only provides ReadWriteOnce (RWO) volumes. There is no native RWX Filesystem support.
 
-**When it occurs:** Any KubeVirt feature that requires RWX Filesystem volumes, such as `vmStateStorageClass` for CBT live migration.
+**When it occurs:** Currently, CBT (Changed Block Tracking) across live migration requires RWX Filesystem for `vmStateStorageClass` due to a libvirt bug ([RHEL-113574](https://issues.redhat.com/browse/RHEL-113574)). This is expected to be resolved in a future libvirt update, after which RWO should be sufficient. CBT without live migration (e.g. restart) already works with RWO Block.
 
-**Impact:** Features like CBT across live migration are not available without an additional RWX-capable storage provider.
+**Impact:** Until the libvirt fix is available, CBT across live migration on GCP requires an additional RWX-capable storage provider.
 
-**Mitigation:** Deploy a separate RWX Filesystem storage solution (e.g. GCP Filestore CSI, NFS) alongside GCP PD for features that require it.
+**Mitigation:** If CBT across live migration is needed before the fix, deploy a separate RWX Filesystem storage solution (e.g. GCP Filestore CSI, NFS) alongside GCP PD.
 
 ---
 
@@ -127,8 +148,8 @@ googleapi: Error 400: Invalid resource usage: 'Disk cannot be resized while ther
 | Limit / Error | Value | Impact |
 |---------------|-------|--------|
 | Minimum disk size (Hyperdisk Balanced) | 4 GB | PVC creation fails below this |
-| Volume attachment limit per node | ~15 | Pods fail to schedule beyond this |
+| Volume attachment limit per node | 3-127 (varies by machine type) | Pods fail to schedule beyond this |
 | Storage pool IOPS overprovisioning | Pool-defined limit | PVC creation fails when pool IOPS exceeded |
 | Storage pool throughput overprovisioning | Pool-defined limit | PVC creation fails when pool throughput exceeded |
 | Disk resize rate limit | 1 resize at a time per disk | Concurrent/rapid resizes fail |
-| RWX Filesystem support | Not available (RWO only) | Features requiring RWX FS need separate storage |
+| RWX Filesystem support | Not available (RWO only) | CBT across live migration temporarily requires separate RWX storage |
