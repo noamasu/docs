@@ -16,10 +16,11 @@ googleapi: Error 400: Disk size cannot be smaller than 4 GB for disk type hyperd
 
 **Impact:** PVC stays in `Pending` state indefinitely. VMs that depend on the PVC will not start.
 
-**Mitigation:** Always request at least 4 Gi. CDI's StorageProfile sets `minimumSupportedPvcSize: 4Gi` to handle this automatically, but the behavior depends on how the DataVolume is defined:
+**Mitigation:** Always request at least 4 Gi. CDI's StorageProfile sets `minimumSupportedPvcSize: 4Gi` to handle this automatically, but the behavior depends on how the volume is created:
 
-- **DataVolume with `storage`:** CDI applies the StorageProfile automatically. Requesting less than 4 Gi (e.g. 1 Gi) will result in a 4 Gi PVC.
-- **DataVolume with `pvc`:** CDI does not apply the StorageProfile by default. To enable automatic size adjustment, add the label `cdi.kubevirt.io/applyStorageProfile: "true"` to the PVC.
+- **DataVolume with `spec.storage`:** CDI applies the StorageProfile automatically. Requesting less than 4 Gi (e.g. 1 Gi) will result in a 4 Gi PVC. This is the recommended approach.
+- **DataVolume with `spec.pvc`:** CDI does not apply the StorageProfile. Request at least 4 Gi explicitly.
+- **Standalone PVC (not created via DataVolume):** Add the label `cdi.kubevirt.io/applyStorageProfile: "true"` to the PVC to enable automatic size adjustment via the CDI mutating webhook.
 
 For full details on Hyperdisk Balanced size and performance limits, see [Hyperdisk Balanced size limits](https://docs.cloud.google.com/compute/docs/disks/hd-types/hyperdisk-balanced#size_limits).
 
@@ -39,10 +40,10 @@ FailedScheduling: 0/N nodes are available: 1 node(s) exceed max volume count
 
 **Details:** Most machine types default to **127** volumes per node. Some bare metal types have lower fixed limits, and `c3-metal` in particular defaults to only **15**. To raise `c3-metal` to 128, your GCP project must first be allowlisted by Google (project-level approval). Once allowlisted, apply the override label to all worker nodes (see below). For the full breakdown by machine type, see [GCP C3 disk and capacity limits](https://docs.cloud.google.com/compute/docs/general-purpose-machines#disk_and_capacity_limits_8).
 
-**How to check the current limit on a node:**
+**How to check the current limit per node:**
 
 ```bash
-oc get csinode <node-name> -o jsonpath='{.spec.drivers[?(@.name=="pd.csi.storage.gke.io")].allocatable.count}'
+oc get csinode -o custom-columns="NAME:.metadata.name,MAX-VOLUMES:.spec.drivers[0].allocatable.count"
 ```
 
 **Mitigation:** Spread volumes across multiple nodes, or override the limit by labeling worker nodes:
@@ -51,15 +52,15 @@ oc get csinode <node-name> -o jsonpath='{.spec.drivers[?(@.name=="pd.csi.storage
 oc label nodes <worker-1> <worker-2> <worker-3> node-restriction.kubernetes.io/gke-volume-attach-limit-override=127 --overwrite
 ```
 
-After applying the label, restart the CSI driver node pods for the new limit to take effect:
+After applying the label, restart the CSI driver node pods for the new limit to take effect, then re-run the check command above to confirm the updated values:
 
 ```bash
 oc delete pod -n openshift-cluster-csi-drivers -l app=gcp-pd-csi-driver-node
 ```
 
-The valid override range is 1-127. For a full step-by-step override procedure (including required RBAC and CSI driver image changes), see [GCP PD CSI Volume Attachment Limit Override](gcp-volume-attachment-limit-override.md).
+The valid override range is 1-127. The values reported by the CSI driver already account for the node boot disk (GCP limits are reduced by one before being reported to Kubernetes).
 
-> **Note:** The node boot disk is considered an attachable disk, so the effective usable limit is one less than the reported value.
+> **Important:** OCP version **4.21.5** or later is required for the volume attachment limit override to work correctly, as it contains the necessary fixes in the GCP PD CSI driver.
 
 ---
 
@@ -103,43 +104,40 @@ storage pool's provisioned throughput., badRequest
 
 ---
 
-## 5. Disk Resize Rate Limiting
+## 5. Online Resize Not Supported in RWX (Multi-Writer) Mode
 
 **Error:**
 
 ```
-googleapi: Error 400: Invalid resource usage: 'Disk cannot be resized due to being rate limited.'
+googleapi: Error 400: Size of disks of type hyperdisk-balanced in READ_WRITE_MANY mode cannot be updated when they are attached., badRequest
 ```
 
-```
-googleapi: Error 400: Invalid resource usage: 'Disk cannot be resized while there is an ongoing mutation.'
-```
+**When it occurs:** Attempting to resize (expand) a PVC while it is attached to a running VM and the underlying Hyperdisk Balanced volume is in `READ_WRITE_MANY` (RWX) mode. Resizing attached volumes in `READ_WRITE_SINGLE` (RWO) mode works as expected.
 
-**When it occurs:** Performing rapid or concurrent PVC resize operations. A single resize works fine; back-to-back or parallel resizes on the same or multiple disks trigger the rate limit.
+**Impact:** PVC expansion fails with `ControllerResizeError`. The VM does not see the size change.
 
-**Impact:** PVC expansion fails with `ControllerResizeError`. The CSI resizer backs off exponentially, and the resize may not complete within expected timeframes. The guest VM does not see the size change.
+**Mitigation:** To resize a Hyperdisk Balanced volume in RWX mode, detach it from all VMs first (stop the VM), perform the resize, then reattach. For details, see [Modify a Hyperdisk volume](https://docs.google.com/compute/docs/disks/modify-hyperdisks#capacity_changes).
 
-**Details observed in testing:**
-
-| Scenario | Result |
-|----------|--------|
-| Single VM, single resize (e.g. 8 Gi to 16 Gi) | Succeeded |
-| 10 VMs, single resize simultaneously | Succeeded (some took ~30 s for node-level FS resize) |
-| 10 VMs, double resize (rapid back-to-back) | All 10 PVCs stuck; GCP returned rate-limit error |
-
-**Mitigation:** Avoid rapid sequential resizes on the same disk. When performing bulk expansions, stagger them or allow each resize to complete before initiating the next.
+For reference: [CNV-75698](https://issues.redhat.com/browse/CNV-75698)
 
 ---
 
 ## 6. No Native RWX Filesystem Support
 
-**Symptom:** GCP PD only provides ReadWriteOnce (RWO) volumes. There is no native RWX Filesystem support.
+**Symptom:** The GCP PD CSI driver supports RWX in Block mode (multi-writer, up to 8 instances) but does not support RWX in Filesystem mode.
 
-**When it occurs:** Currently, CBT (Changed Block Tracking) across live migration requires RWX Filesystem for `vmStateStorageClass` due to a libvirt bug ([RHEL-113574](https://issues.redhat.com/browse/RHEL-113574)). This is expected to be resolved in a future libvirt update, after which RWO should be sufficient. CBT without live migration (e.g. restart) already works with RWO Block.
+**When it occurs:** CBT (Changed Block Tracking) across live migration currently requires RWX Filesystem for `vmStateStorageClass`. This requirement is caused by two libvirt bugs:
 
-**Impact:** Until the libvirt fix is available, CBT across live migration on GCP requires an additional RWX-capable storage provider.
+- [RHEL-113574](https://issues.redhat.com/browse/RHEL-113574): Migration fails when the qcow2 overlay with a data-file is not on shared storage. An upstream fix exists but has not been officially released.
+- [RHEL-145769](https://issues.redhat.com/browse/RHEL-145769): Even with the above fix applied, dirty bitmaps (used by CBT) are not transferred during live migration. After migration, the next backup falls back to a full backup since no bitmaps exist on the target. A fix is in progress but has not been officially released.
 
-**Mitigation:** If CBT across live migration is needed before the fix, deploy a separate RWX Filesystem storage solution (e.g. GCP Filestore CSI, NFS) alongside GCP PD.
+Once both fixes are released and shipped as part of the CNV bundle (in a libvirt RPM containing the fixes), RWO storage should be sufficient for CBT across live migration, removing the need for a separate RWX provider on GCP.
+
+CBT without live migration (e.g. restart) already works with RWO Block and is not affected by these issues.
+
+**Impact:** Until both libvirt fixes are officially released and shipped, CBT across live migration on GCP requires an additional RWX-capable storage provider.
+
+**Mitigation:** If CBT across live migration is needed before the fixes are available, deploy a separate RWX Filesystem storage solution (e.g. Google Cloud NetApp Volumes, GCP Filestore CSI, NFS) alongside GCP PD.
 
 ---
 
@@ -151,5 +149,5 @@ googleapi: Error 400: Invalid resource usage: 'Disk cannot be resized while ther
 | Volume attachment limit per node | 3-127 (varies by machine type) | Pods fail to schedule beyond this |
 | Storage pool IOPS overprovisioning | Pool-defined limit | PVC creation fails when pool IOPS exceeded |
 | Storage pool throughput overprovisioning | Pool-defined limit | PVC creation fails when pool throughput exceeded |
-| Disk resize rate limit | 1 resize at a time per disk | Concurrent/rapid resizes fail |
-| RWX Filesystem support | Not available (RWO only) | CBT across live migration temporarily requires separate RWX storage |
+| Online resize in RWX mode | Not supported | Must detach volume from all VMs before resizing |
+| RWX Filesystem support | Block only (no Filesystem) | CBT across live migration requires separate RWX Filesystem storage until libvirt fixes are shipped |

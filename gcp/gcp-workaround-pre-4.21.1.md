@@ -9,7 +9,7 @@
 
 This configuration enables key KubeVirt capabilities like Live Migration and performing more than 6 restores per hour from a single snapshot on Google Cloud Platform (GCP). It uses a VolumeSnapshotClass with the `snapshot-type: images` parameter.
 
-## Why This Configuration is Needed
+## Overview
 
 On GCP with the PD CSI driver, OS images are stored as VolumeSnapshots and VMs are created by restoring disks from those snapshots.
 
@@ -40,9 +40,9 @@ This configuration creates dedicated storage resources for images. Your existing
 
 ## Configuration Steps
 
-### Step 1: Create a Hyperdisk StorageClass (prerequisite)
+### Step 1: Create a Hyperdisk StorageClass
 
-If you do not already have a default Hyperdisk StorageClass, create your primary Hyperdisk storage that will be used for regular VM snapshots and for the golden-image StorageClass in Step 2.
+If you do not already have a default Hyperdisk StorageClass, create your primary Hyperdisk storage that will be used for regular VM snapshots and for the OS images StorageClass in Step 3.
 
 Create a file named `hyperdisk-storageclass.yaml` with the following content:
 
@@ -75,9 +75,7 @@ Apply:
 oc apply -f hyperdisk-storageclass.yaml
 ```
 
-### Step 1.1: Remove default from standard-csi StorageClass
-
-GCP clusters come with a `standard-csi` StorageClass set as default. After creating the Hyperdisk StorageClass as the new default, remove the default annotation from `standard-csi` to avoid having two default StorageClasses:
+GCP clusters come with a `standard-csi` StorageClass set as default. Remove the default annotation from `standard-csi` to avoid having two default StorageClasses:
 
 ```bash
 oc annotate storageclass standard-csi storageclass.kubernetes.io/is-default-class-
@@ -89,7 +87,17 @@ Verify only your Hyperdisk StorageClass is marked as default:
 oc get storageclass
 ```
 
-### Step 2: Create a StorageClass for Hyperdisk Golden Images
+### Step 2: Verify volume attachment limits
+
+Check the maximum volume attachment limit reported by each node:
+
+```bash
+oc get csinode -o custom-columns="NAME:.metadata.name,MAX-VOLUMES:.spec.drivers[0].allocatable.count"
+```
+
+If any node shows a low value (e.g. 15), you may need to apply an override label before running workloads at scale. See [Volume Attachment Limit Per Node](gcp-known-errors-and-limits.md#2-volume-attachment-limit-per-node) for details and override instructions.
+
+### Step 3: Create a StorageClass for Hyperdisk OS Images
 
 Duplicate your existing GCP Hyperdisk StorageClass and create `virt-os-images-rwo`.
 
@@ -128,7 +136,7 @@ Apply:
 oc apply -f <your-sc-file.yaml>
 ```
 
-### Step 3: Create a VolumeSnapshotClass with Special Parameter
+### Step 4: Create a VolumeSnapshotClass with Special Parameter
 
 Duplicate your existing VolumeSnapshotClass and create `csi-gce-pd-vsc-images`.
 
@@ -164,9 +172,9 @@ Apply:
 oc apply -f <your-vsc-file.yaml>
 ```
 
-### Step 4: Configure StorageProfile
+### Step 5: Configure StorageProfile
 
-KubeVirt automatically creates a StorageProfile after Step 2. Configure it to use RWO access modes and the `csi-gce-pd-vsc-images` VolumeSnapshotClass:
+KubeVirt automatically creates a StorageProfile after Step 3. Configure it to use RWO access modes and the `csi-gce-pd-vsc-images` VolumeSnapshotClass:
 
 Edit:
 
@@ -197,7 +205,7 @@ spec:
   snapshotClass: csi-gce-pd-vsc-images
 ```
 
-### Step 5: Update HyperConverged CR for Golden Images
+### Step 6: Update HyperConverged CR for OS Images
 
 Configure `dataImportCronTemplates` to use `virt-os-images-rwo` StorageClass.
 
@@ -234,9 +242,9 @@ spec:
                 storage: <size>
 ```
 
-### Step 6: Delete Existing Snapshots to Trigger Re-import
+### Step 7: Delete Existing Snapshots to Trigger Re-import
 
-Now that the configuration is complete, delete existing golden image snapshots to trigger re-import with the new `virt-os-images-rwo` StorageClass and `csi-gce-pd-vsc-images` VolumeSnapshotClass:
+Now that the configuration is complete, delete existing OS image snapshots to trigger re-import with the new `virt-os-images-rwo` StorageClass and `csi-gce-pd-vsc-images` VolumeSnapshotClass:
 
 List snapshots:
 
@@ -252,9 +260,9 @@ oc delete volumesnapshot --all-namespaces --selector cdi.kubevirt.io/dataImportC
 
 DataImportCron will automatically trigger a new import using the new configuration.
 
-### Step 7: Verify the Configuration
+### Step 8: Verify the Configuration
 
-After golden images are re-imported, verify:
+After OS images are re-imported, verify:
 
 Snapshots use `csi-gce-pd-vsc-images`:
 
@@ -296,18 +304,18 @@ VM PVCs should show the default StorageClass, not `virt-os-images-rwo`.
 - VM disks created from images use the default StorageClass (typically RWX), not `virt-os-images-rwo`
 - Snapshots of VM disks use the default VolumeSnapshotClass (without `snapshot-type: images`), not `csi-gce-pd-vsc-images`
 - The default VolumeSnapshotClass is limited to 6 restores per hour from a single snapshot
-- Golden image imports (via DataImportCron) use the `virt-os-images-rwo` StorageClass
+- OS image imports (via DataImportCron) use the `virt-os-images-rwo` StorageClass
 
 ## Additional Notes
 
 **Custom Image Uploads:**
 
-- For custom images uploaded (not from golden images), use the `virt-os-images-rwo` StorageClass to ensure snapshots can be restored more than 6 times per hour
+- For custom images uploaded (not from DataImportCron), use the `virt-os-images-rwo` StorageClass to ensure snapshots can be restored more than 6 times per hour
 - Using `virt-os-images-rwo` StorageClass stores the uploaded image as a RWO PVC, and snapshots created from this PVC will use the `csi-gce-pd-vsc-images` VolumeSnapshotClass (with `snapshot-type: images`)
 - These snapshots can be restored to RWX PVCs and support more than 6 restores per hour
 - If you upload custom images using a different StorageClass, they will not benefit from these capabilities and will be subject to the 6 restores per hour limitation
 
-**After Setup:** Once golden images are re-imported with the correct configuration, the StorageProfile's explicit `snapshotClass` setting ensures they continue using the `csi-gce-pd-vsc-images` VolumeSnapshotClass.
+**After Setup:** Once OS images are re-imported with the correct configuration, the StorageProfile's explicit `snapshotClass` setting ensures they continue using the `csi-gce-pd-vsc-images` VolumeSnapshotClass.
 
 ## Troubleshooting
 
@@ -321,12 +329,12 @@ VM PVCs should show the default StorageClass, not `virt-os-images-rwo`.
    ```bash
    oc get storageprofile virt-os-images-rwo -o yaml | grep snapshotClass
    ```
-2. If missing or incorrect, update the StorageProfile as described in Step 4.
+2. If missing or incorrect, update the StorageProfile as described in Step 5.
 3. Delete existing snapshots again to trigger re-import with the correct configuration.
 
 ### Still hitting 6 restores per hour limitation
 
-**Symptom:** Creating multiple VMs from the same golden image fails after 6 restores per hour.
+**Symptom:** Creating multiple VMs from the same OS image fails after 6 restores per hour.
 
 **Solution:**
 
@@ -338,7 +346,7 @@ VM PVCs should show the default StorageClass, not `virt-os-images-rwo`.
    ```bash
    oc get volumesnapshotclass csi-gce-pd-vsc-images -o yaml | grep snapshot-type
    ```
-3. If either is incorrect, review Steps 3 and 4 to ensure proper configuration.
+3. If either is incorrect, review Steps 4 and 5 to ensure proper configuration.
 
 ### StorageProfile not automatically created
 
@@ -353,9 +361,9 @@ VM PVCs should show the default StorageClass, not `virt-os-images-rwo`.
    ```
 3. If it doesn't exist, verify the StorageClass was created correctly and check KubeVirt operator logs.
 
-### Golden images not re-importing after deleting snapshots
+### OS images not re-importing after deleting snapshots
 
-**Symptom:** After deleting snapshots in Step 6, golden images don't re-import.
+**Symptom:** After deleting snapshots in Step 7, OS images don't re-import.
 
 **Solution:**
 
@@ -380,7 +388,7 @@ VM PVCs should show the default StorageClass, not `virt-os-images-rwo`.
    oc get pvc -n <vm-namespace>
    ```
 2. Check that the default StorageClass supports RWX access mode (required for Live Migration).
-3. Verify the golden image snapshot exists and is ready:
+3. Verify the OS image snapshot exists and is ready:
    ```bash
    oc get volumesnapshot --all-namespaces
    ```
