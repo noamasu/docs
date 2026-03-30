@@ -273,7 +273,7 @@ oc apply -f gcnv-csi-snapclass.yaml
 
 ### Step 5: Set the Filesystem Overhead
 
-NFS volumes consume part of their provisioned capacity for filesystem metadata. The recommended filesystem overhead for GCNV is **10%**. Without this, CDI may provision PVCs that are too small for operations that need temporary space (e.g. gzipped exports). See [Filesystem Overhead](gcnv-known-errors-and-limits.md#4-filesystem-overhead--no-space-left-on-device-during-gzipped-export) for details.
+NFS volumes consume part of their provisioned capacity for filesystem metadata. The recommended filesystem overhead for GCNV is **10%**. Without this, CDI may provision PVCs that are too small for operations that need temporary space (e.g. gzipped exports). See [ONTAP Volume Space Reporting](gcnv-known-errors-and-limits.md#4-ontap-volume-space-reporting---no-space-left-on-device-near-full-capacity) for details.
 
 Patch the HyperConverged CR to set the overhead for the `gcnv-flex` StorageClass:
 

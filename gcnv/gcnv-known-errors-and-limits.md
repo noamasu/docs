@@ -89,23 +89,39 @@ All in Filesystem mode. Block access modes (`ReadWriteOncePod` with Block, or an
 
 ---
 
-## 4. Filesystem Overhead - "No Space Left on Device" During Gzipped Export
+## 4. ONTAP Volume Space Reporting - "No Space Left on Device" Near Full Capacity
 
 **Error:**
 
 ```
-gzip: /data/disk.img.gz: No space left on device
+'/disk/disk.img': No space left on device
 ```
 
-**When it occurs:** Exporting a VM disk in gzipped format via `VirtualMachineExport`. The export downloads the raw disk image and runs `gzip` on the same PVC, exceeding the available space after NFS metadata overhead.
+**When it occurs:** Writing to a GCNV-backed NFS volume that is near full capacity (~97-98%). This commonly surfaces during VM storage migration when the source and destination PVCs are the same size.
 
-**Impact:** Gzipped export tests fail. Non-gzipped exports (RAW, archive, tarred gzipped) work correctly.
+**Impact:** Operations fail with `ENOSPC` even when `statfs` reports available blocks. For example, storage migration from a 2Gi PVC to another 2Gi PVC fails, while migrating to a larger destination PVC succeeds.
 
-**Details:** NFS filesystem metadata consumes part of the provisioned volume capacity. The default CDI filesystem overhead (5.5%) is not enough for GCNV's NFS volumes. When CDI provisions the target PVC with the same size as the source, the actual usable space is reduced by NFS overhead, and operations that need temporary space on the same PVC (like gzip) fail.
+**Details:** ONTAP reserves approximately **2-3%** of the volume capacity internally for metadata and write-time quota enforcement. Unlike standard NFS servers, ONTAP does not simply check space upfront - it enforces quotas during the write request itself. This means `statfs` may report available blocks, but the actual write can still fail:
 
-The recommended filesystem overhead for GCNV is **10%** (`0.10`). This should be configured as part of the initial setup (see [gcnv-storage-configuration.md](gcnv-storage-configuration.md)).
+```
+bash-5.1$ stat -fc %a /disk/
+15
+bash-5.1$ dd if=/dev/urandom bs=65536 count=1 oflag=append conv=notrunc of=/disk/disk.img
+dd: closing output file '/disk/disk.img': No space left on device
+bash-5.1$ stat -fc %a /disk/
+0
+```
 
-**Mitigation:** Set the filesystem overhead for the GCNV StorageClass by patching the HyperConverged CR:
+In the example above, `statfs` reports 15 available blocks, but the write fails during the close/commit phase. The writing method and block alignment can influence at what exact point the failure occurs, which is why different KubeVirt operations with the same volume size may produce different results.
+
+For more details on ONTAP logical space reporting and quota behavior, see:
+- [ONTAP logical space reporting](https://docs.netapp.com/us-en/ontap/volumes/logical-space-reporting-concept.html)
+- [Space display with quotas on UNIX clients](https://docs.netapp.com/us-en/ontap/volumes/space-display-quota-report-unix-client-concept.html)
+- [Proper configuration for a volume containing a LUN](https://kb.netapp.com/on-prem/ontap/da/SAN/SAN-KBs/What_is_the_proper_configuration_for_a_volume_containing_a_LUN)
+
+**Mitigation:** Configure the CDI filesystem overhead for the GCNV StorageClass to **10%** so that destination PVCs are provisioned with enough headroom to account for ONTAP's internal space reservation. This should be configured as part of the initial setup (see [gcnv-storage-configuration.md](gcnv-storage-configuration.md)).
+
+Patch the HyperConverged CR:
 
 ```bash
 oc patch hyperconverged kubevirt-hyperconverged -n openshift-cnv --type=merge -p '
@@ -156,5 +172,5 @@ For the full breakdown of service levels and performance characteristics, see [G
 | Minimum volume size (Flex) | 1 GiB | PVC creation fails below this |
 | Maximum volumes per Flex pool | 50 | PVC creation fails when pool is full; use multiple pools |
 | Block volume mode | Not supported | NFS provides Filesystem mode only |
-| NFS filesystem overhead | ~5-10% | Gzipped exports may fail with "No space left" |
+| ONTAP internal space reservation | ~2-3% | Writes fail near full capacity; set 10% filesystem overhead |
 | Pool throughput / IOPS | Shared across all volumes in the pool | Size pools to match VM workload; use custom performance or multiple pools |
