@@ -40,7 +40,7 @@ rpc error: code = ResourceExhausted desc = pool has reached its maximum volume c
 
 **Impact:** PVC provisioning fails. The PVC stays in `Pending`.
 
-**Details:** GCNV Flex pools are limited to **50 volumes per pool**. See [GCNV storage pool limits](https://docs.cloud.google.com/netapp/volumes/docs/quotas#storage_pool_limits). This limit is reached quickly when running KubeVirt workloads that create many DVs/PVCs (e.g. test suites, many VMs, snapshots). Unlike GCP Hyperdisk storage pools (which have higher limits), GCNV requires multiple pools to scale.
+**Details:** GCNV Flex pools are limited to **50 volumes per pool**. See [GCNV storage pool limits](https://docs.cloud.google.com/netapp/volumes/docs/quotas#storage_pool_limits). This limit is reached quickly when running KubeVirt workloads that create many DVs/PVCs (e.g. many VMs, snapshots). To scale beyond 50 volumes, create multiple pools and list them all in the TridentBackendConfig.
 
 **Mitigation:** Create multiple storage pools and list all of them in the `TridentBackendConfig`. Trident will distribute volumes across the available pools. For example, 16 pools with 1 TiB each provides capacity for up to 800 volumes:
 

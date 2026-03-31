@@ -34,9 +34,9 @@ This guide walks you through Trident installation and configuration on an OpenSh
 
   For details on creating the service account itself and assigning the required roles, see [Prepare to configure a GCNV backend](https://docs.netapp.com/us-en/trident/trident-use/gcnv-prep.html) and [Create a service account key](https://cloud.google.com/iam/docs/keys-create-delete#creating).
 - **Private Service Access (PSA)** configured on the cluster's VPC network - see [Set up access to Google Cloud NetApp Volumes](https://cloud.google.com/netapp/volumes/docs/get-started/configure-access/workflow#before_you_begin)
-- **One or more GCNV storage pools** created in the same zone as your worker nodes - see [Create a storage pool](https://docs.cloud.google.com/netapp/volumes/docs/configure-and-use/storage-pools/create-storage-pool)
+- **One or more GCNV storage pools** - see [Create a storage pool](https://docs.cloud.google.com/netapp/volumes/docs/configure-and-use/storage-pools/create-storage-pool). Flex pools can be **zonal** (created in the same zone as your worker nodes) or **regional** (replicates volumes across zones). Regional pools only support default performance (not custom). For zonal pools, specify the zone in the TridentBackendConfig `location` field; for regional pools, specify the region.
 
-> **Storage pool sizing:** GCNV Flex pools are limited to **50 volumes per pool** ([GCNV storage pool limits](https://docs.cloud.google.com/netapp/volumes/docs/quotas#storage_pool_limits)). Each Flex pool has a minimum capacity of 1 TiB. Create multiple pools and list them all in the TridentBackendConfig - Trident distributes volumes across pools automatically. For example, 4 pools support ~200 volumes, 16 pools support ~800 volumes. Flex pools are **zonal** and must be in the same zone as your worker nodes.
+> **Storage pool sizing:** GCNV Flex pools are limited to **50 volumes per pool** ([GCNV storage pool limits](https://docs.cloud.google.com/netapp/volumes/docs/quotas#storage_pool_limits)). Each Flex pool has a minimum capacity of 1 TiB. Create multiple pools and list them all in the TridentBackendConfig - Trident distributes volumes across pools automatically. For example, 4 pools support ~200 volumes, 16 pools support ~800 volumes.
 
 For the full GCNV preparation checklist (service account, PSA, storage pools, API key), see [Prepare to configure a GCNV backend](https://docs.netapp.com/us-en/trident/trident-use/gcnv-prep.html).
 
@@ -54,19 +54,23 @@ Choose one of the two options below.
 2. Install the **NetApp Trident** operator (version 26.02.0 or later)
 3. Once installed, go to **Installed Operators** and open **Trident**
 4. Click **Create TridentOrchestrator**
-5. Before clicking **Create**, add `enableConcurrency: true` to the spec:
+5. Switch to **YAML view**, ensure the full CR looks like the following (add `enableConcurrency: true`), and click **Create**:
 
 ```yaml
-apiVersion: trident.netapp.io/v1
 kind: TridentOrchestrator
+apiVersion: trident.netapp.io/v1
 metadata:
   name: trident
 spec:
+  IPv6: false
+  debug: true
+  nodePrep: []
+  imagePullSecrets: []
+  imageRegistry: ''
   namespace: trident
+  silenceAutosupport: false
   enableConcurrency: true
 ```
-
-6. Click **Create**
 
 For full details, see [Manually deploy the Trident operator](https://docs.netapp.com/us-en/trident/trident-get-started/kubernetes-deploy-operator.html).
 
@@ -85,6 +89,8 @@ cd trident-installer
 ```
 
 For full details, see [Install using tridentctl](https://docs.netapp.com/us-en/trident/trident-get-started/kubernetes-deploy-tridentctl.html).
+
+You can also install Trident using Helm. See [Use Trident Helm Chart](https://docs.netapp.com/us-en/trident/trident-get-started/kubernetes-deploy-helm.html) for details.
 
 #### Verify
 
@@ -171,7 +177,9 @@ spec:
 > jq 'del(.private_key_id, .private_key)' trident-admin.json
 > ```
 
-> **Important:** For Flex service level, `location` must be the **zone** (e.g. `us-central1-a`), not the region. For Standard/Premium/Extreme, use the **region** (e.g. `us-central1`).
+> **Important:** For Flex zonal pools, `location` must be the **zone** (e.g. `us-central1-a`). For Flex regional pools or Standard/Premium/Extreme, use the **region** (e.g. `us-central1`).
+
+> **Note:** The `storagePools` list is optional. If omitted, Trident will use any pool with the matching service level in the configured location. Explicitly listing pools is only necessary if you want to restrict which pools Trident uses (e.g. when pools in the same project/location are shared across clusters).
 
 Apply both resources:
 
