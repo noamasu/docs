@@ -40,7 +40,7 @@ rpc error: code = ResourceExhausted desc = pool has reached its maximum volume c
 
 **Impact:** PVC provisioning fails. The PVC stays in `Pending`.
 
-**Details:** GCNV Flex pools are limited to **50 volumes per pool**. See [GCNV storage pool limits](https://docs.cloud.google.com/netapp/volumes/docs/quotas#storage_pool_limits). This limit is reached quickly when running KubeVirt workloads that create many DVs/PVCs (e.g. many VMs, snapshots). To scale beyond 50 volumes, create multiple pools and list them all in the TridentBackendConfig.
+**Details:** GCNV Flex (File) pools are limited to **50 volumes per pool**. See [GCNV storage pool limits](https://docs.cloud.google.com/netapp/volumes/docs/quotas#storage_pool_limits). This limit is reached quickly when running OpenShift Virtualization workloads that create many DVs/PVCs (e.g. many VMs, snapshots). To scale beyond 50 volumes, create multiple pools and list them all in the TridentBackendConfig.
 
 **Mitigation:** Create multiple storage pools and list all of them in the `TridentBackendConfig`. Trident will distribute volumes across the available pools. For example, 16 pools with 1 TiB each provides capacity for up to 800 volumes:
 
@@ -57,69 +57,23 @@ See [gcnv-storage-configuration.md](gcnv-storage-configuration.md) for the full 
 
 ---
 
-## 3. No Block Volume Mode Support (NFS-only)
-
-**Symptom:** GCNV volumes are NFS-backed and only support `volumeMode: Filesystem`. Any PVC or DataVolume requesting `volumeMode: Block` will fail to provision.
-
-**When it occurs:** Tests or workloads that explicitly require raw block devices (e.g. CBT/changed block tracking, block-mode hotplug, block-mode volume migration).
-
-**Impact:** DataVolumes requesting block mode stay in `WaitForFirstConsumer` or `ImportScheduled` indefinitely. Pods that depend on block PVCs will fail to schedule.
-
-**Details:** The Trident `google-cloud-netapp-volumes` driver supports NFS protocol only. It provides:
-
-- `ReadWriteOnce` (RWO)
-- `ReadWriteMany` (RWX)
-- `ReadOnlyMany` (ROX)
-
-All in Filesystem mode. Block access modes (`ReadWriteOncePod` with Block, or any Block mode) are not supported.
-
-**Impact on KubeVirt features:**
-
-| Feature | Status |
-|---|---|
-| VM disk storage | Works (Filesystem mode) |
-| Live migration | Works (RWX Filesystem) |
-| Hotplug volumes (Filesystem) | Works |
-| Hotplug volumes (Block) | Not supported |
-| VM snapshots and restores | Works |
-| VM export (non-gzipped) | Works |
-| CBT / Incremental backup | Not supported (requires Block or RWX Filesystem with libvirt fixes) |
-
-**Mitigation:** Use Filesystem mode for all volumes. If block-mode features are required, deploy a separate block-capable storage provider alongside GCNV.
-
----
-
-## 4. ONTAP Volume Space Reporting - "No Space Left on Device" Near Full Capacity
+## 3. ONTAP Volume Space Reporting - "No Space Left on Device" Near Full Capacity
 
 **Error:**
 
 ```
-'/disk/disk.img': No space left on device
+No space left on device
 ```
 
-**When it occurs:** Writing to a GCNV-backed NFS volume that is near full capacity (~97-98%). This commonly surfaces during VM storage migration when the source and destination PVCs are the same size.
+**When it occurs:** Writing to a GCNV-backed NFS volume that is near full capacity (~97-98%).
 
-**Impact:** Operations fail with `ENOSPC` even when `statfs` reports available blocks. For example, storage migration from a 2Gi PVC to another 2Gi PVC fails, while migrating to a larger destination PVC succeeds.
+**Details:** ONTAP reserves approximately **2-3%** of the volume capacity internally for metadata and quota enforcement. This means a volume can report available space but still fail writes with `ENOSPC` before reaching 100% usage.
 
-**Details:** ONTAP reserves approximately **2-3%** of the volume capacity internally for metadata and write-time quota enforcement. Unlike standard NFS servers, ONTAP does not simply check space upfront - it enforces quotas during the write request itself. This means `statfs` may report available blocks, but the actual write can still fail:
-
-```
-bash-5.1$ stat -fc %a /disk/
-15
-bash-5.1$ dd if=/dev/urandom bs=65536 count=1 oflag=append conv=notrunc of=/disk/disk.img
-dd: closing output file '/disk/disk.img': No space left on device
-bash-5.1$ stat -fc %a /disk/
-0
-```
-
-In the example above, `statfs` reports 15 available blocks, but the write fails during the close/commit phase. The writing method and block alignment can influence at what exact point the failure occurs, which is why different KubeVirt operations with the same volume size may produce different results.
-
-For more details on ONTAP logical space reporting and quota behavior, see:
+For more details on ONTAP logical space reporting, see:
 - [ONTAP logical space reporting](https://docs.netapp.com/us-en/ontap/volumes/logical-space-reporting-concept.html)
 - [Space display with quotas on UNIX clients](https://docs.netapp.com/us-en/ontap/volumes/space-display-quota-report-unix-client-concept.html)
-- [Proper configuration for a volume containing a LUN](https://kb.netapp.com/on-prem/ontap/da/SAN/SAN-KBs/What_is_the_proper_configuration_for_a_volume_containing_a_LUN)
 
-**Mitigation:** Configure the CDI filesystem overhead for the GCNV StorageClass to **10%** so that destination PVCs are provisioned with enough headroom to account for ONTAP's internal space reservation. This should be configured as part of the initial setup (see [gcnv-storage-configuration.md](gcnv-storage-configuration.md)).
+**Mitigation:** Configure the CDI filesystem overhead for the GCNV StorageClass to **10%** so that PVCs are provisioned with enough headroom to account for ONTAP's internal space reservation. This should be configured as part of the initial setup (see [gcnv-storage-configuration.md](gcnv-storage-configuration.md)).
 
 Patch the HyperConverged CR:
 
@@ -146,15 +100,15 @@ You should see `gcnv-flex` listed with `0.10`.
 
 ---
 
-## 5. Storage Pool Throughput and IOPS Sizing
+## 4. Storage Pool Throughput and IOPS Sizing
 
 **Symptom:** VM disk I/O is slower than expected, or multiple VMs on the same pool experience degraded performance under load.
 
 **When it occurs:** The storage pool's throughput or IOPS is insufficient for the number and type of VM workloads running against it.
 
-**Details:** GCNV Flex File pools have throughput and IOPS that are shared across all volumes in the pool. The default performance scales at **16 KiBps per GiB** of provisioned pool capacity. In [supported regions](https://docs.cloud.google.com/netapp/volumes/docs/discover/service-levels#supported_regions_for_flex_file_custom_performance), custom performance pools allow setting explicit throughput (up to 5 GiBps) and IOPS (up to 160,000) per pool.
+**Details:** GCNV Flex (File) pools have throughput and IOPS that are shared across all volumes in the pool. The default performance scales at **16 KiBps per GiB** of provisioned pool capacity. In [supported regions](https://docs.cloud.google.com/netapp/volumes/docs/discover/service-levels#supported_regions_for_flex_file_custom_performance), custom performance pools allow setting explicit throughput (up to 5 GiBps) and IOPS (up to 160,000) per pool.
 
-For VM workloads, the Flex File service level is the most common choice due to its lower minimum pool size (1 TiB) and volume size (1 GiB). However, the default throughput (16 KiBps/GiB) may be insufficient for I/O-intensive VMs. For example, a 1 TiB pool at default performance provides only ~16 MiBps throughput. If running many VMs or I/O-heavy workloads, consider:
+The default throughput (16 KiBps/GiB) may be insufficient for I/O-intensive VMs. For example, a 1 TiB pool at default performance provides only ~16 MiBps throughput. If running many VMs or I/O-heavy workloads, consider:
 
 - **Custom performance pools** - allows setting explicit throughput (MiBps) and IOPS at pool creation time. Available in [supported regions](https://docs.cloud.google.com/netapp/volumes/docs/discover/service-levels#supported_regions_for_flex_file_custom_performance).
 - **Spreading VMs across multiple pools** - distributes I/O load. Each pool has its own throughput/IOPS budget.
@@ -171,6 +125,5 @@ For the full breakdown of service levels and performance characteristics, see [G
 |---|---|---|
 | Minimum volume size (Flex) | 1 GiB | PVC creation fails below this |
 | Maximum volumes per Flex pool | 50 | PVC creation fails when pool is full; use multiple pools |
-| Block volume mode | Not supported | NFS provides Filesystem mode only |
 | ONTAP internal space reservation | ~2-3% | Writes fail near full capacity; set 10% filesystem overhead |
 | Pool throughput / IOPS | Shared across all volumes in the pool | Size pools to match VM workload; use custom performance or multiple pools |

@@ -8,6 +8,8 @@
 
 Google Cloud NetApp Volumes (GCNV) provides NFS-based shared storage for OpenShift Virtualization workloads on Google Cloud. GCNV supports **ReadWriteMany (RWX) in Filesystem mode**, which enables VM live migration, and is provisioned through the **NetApp Trident CSI driver**.
 
+> **Important:** This guide covers the **Flex File** service level only. When creating storage pools, select the **File** storage type (not "Unified"). Flex Unified (which adds iSCSI/block support) is not covered in this release.
+
 This guide walks you through Trident installation and configuration on an OpenShift cluster that already has GCNV resources provisioned on the Google Cloud side.
 
 **What you will do in this guide:**
@@ -22,18 +24,11 @@ This guide walks you through Trident installation and configuration on an OpenSh
 ## Prerequisites
 
 - **Red Hat OpenShift Container Platform 4.21+** deployed on Google Cloud (including OpenShift Dedicated)
-- **OpenShift Virtualization 4.21.2+** installed
+- **OpenShift Virtualization 4.21.2+** installed with the HyperConverged resource created (default settings)
 - Cluster admin access (`oc login` as `kubeadmin` or equivalent)
 - A **GCP project** with the [Google Cloud NetApp Volumes API enabled](https://cloud.google.com/netapp/volumes/docs/get-started/configure-access/workflow#before_you_begin)
-- A **GCP service account** with the `roles/netapp.admin` role and a **JSON key file** (referred to as `trident-admin.json` throughout this guide). To create one:
-
-  ```bash
-  gcloud iam service-accounts keys create trident-admin.json \
-    --iam-account="<your-service-account>@<your-project-id>.iam.gserviceaccount.com"
-  ```
-
-  For details on creating the service account itself and assigning the required roles, see [Prepare to configure a GCNV backend](https://docs.netapp.com/us-en/trident/trident-use/gcnv-prep.html) and [Create a service account key](https://cloud.google.com/iam/docs/keys-create-delete#creating).
-- **Private Service Access (PSA)** configured on the cluster's VPC network - see [Set up access to Google Cloud NetApp Volumes](https://cloud.google.com/netapp/volumes/docs/get-started/configure-access/workflow#before_you_begin)
+- A **GCP service account** with the **Google Cloud NetApp Volumes Admin** (`roles/netapp.admin`) role and a **JSON key file** (referred to as `trident-admin.json` throughout this guide) - see [Prepare to configure a GCNV backend](https://docs.netapp.com/us-en/trident/trident-use/gcnv-prep.html)
+- **Private Service Access (PSA)** configured on the cluster's VPC network - see [Networking overview](https://docs.cloud.google.com/netapp/volumes/docs/plan-and-prepare/networking)
 - **One or more GCNV storage pools** - see [Create a storage pool](https://docs.cloud.google.com/netapp/volumes/docs/configure-and-use/storage-pools/create-storage-pool). Flex pools can be **zonal** (created in the same zone as your worker nodes) or **regional** (replicates volumes across zones). Regional pools only support default performance (not custom). For zonal pools, specify the zone in the TridentBackendConfig `location` field; for regional pools, specify the region.
 
 > **Storage pool sizing:** GCNV Flex pools are limited to **50 volumes per pool** ([GCNV storage pool limits](https://docs.cloud.google.com/netapp/volumes/docs/quotas#storage_pool_limits)). Each Flex pool has a minimum capacity of 1 TiB. Create multiple pools and list them all in the TridentBackendConfig - Trident distributes volumes across pools automatically. For example, 4 pools support ~200 volumes, 16 pools support ~800 volumes.
@@ -72,7 +67,7 @@ spec:
   enableConcurrency: true
 ```
 
-For full details, see [Manually deploy the Trident operator](https://docs.netapp.com/us-en/trident/trident-get-started/kubernetes-deploy-operator.html).
+For full details, see [Manually deploy the Trident operator](https://docs.netapp.com/us-en/trident/trident-install/kubernetes-deploy-operator.html).
 
 #### Option B: Via `tridentctl` (CLI)
 
@@ -88,9 +83,9 @@ cd trident-installer
 ./tridentctl install --enable-concurrency -n trident --kubeconfig "${KUBECONFIG}"
 ```
 
-For full details, see [Install using tridentctl](https://docs.netapp.com/us-en/trident/trident-get-started/kubernetes-deploy-tridentctl.html).
+For full details, see [Install using tridentctl](https://docs.netapp.com/us-en/trident/trident-install/kubernetes-deploy-tridentctl.html).
 
-You can also install Trident using Helm. See [Use Trident Helm Chart](https://docs.netapp.com/us-en/trident/trident-get-started/kubernetes-deploy-helm.html) for details.
+You can also install Trident using Helm. See [Use Trident Helm Chart](https://docs.netapp.com/us-en/trident/trident-install/kubernetes-deploy-helm.html) for details.
 
 #### Verify
 
@@ -122,7 +117,7 @@ Get your GCP project number:
 gcloud projects describe "${GCP_PROJECT_ID}" --format="value(projectNumber)"
 ```
 
-Create a file named `gcv-backend-flex.yaml` with the following content. Replace all `<placeholder>` values:
+Create a file named `gcnv-backend-flex.yaml` with the following content. Replace all `<placeholder>` values:
 
 ```yaml
 ---
@@ -142,7 +137,7 @@ stringData:
 apiVersion: trident.netapp.io/v1
 kind: TridentBackendConfig
 metadata:
-  name: gcv-backend-flex
+  name: gcnv-backend-flex
   namespace: trident
 spec:
   version: 1
@@ -162,12 +157,12 @@ spec:
   apiKey:
     type: service_account
     project_id: "<your-gcp-project-id>"
-    client_email: "trident-admin@<your-gcp-project-id>.iam.gserviceaccount.com"
+    client_email: "<your-service-account>@<your-gcp-project-id>.iam.gserviceaccount.com"
     client_id: "<client-id-from-json>"
     auth_uri: https://accounts.google.com/o/oauth2/auth
     token_uri: https://oauth2.googleapis.com/token
     auth_provider_x509_cert_url: https://www.googleapis.com/oauth2/v1/certs
-    client_x509_cert_url: "https://www.googleapis.com/robot/v1/metadata/x509/trident-admin%40<your-gcp-project-id>.iam.gserviceaccount.com"
+    client_x509_cert_url: "https://www.googleapis.com/robot/v1/metadata/x509/<your-service-account>%40<your-gcp-project-id>.iam.gserviceaccount.com"
   credentials:
     name: trident-admin
 ```
@@ -177,6 +172,8 @@ spec:
 > jq 'del(.private_key_id, .private_key)' trident-admin.json
 > ```
 
+> **Note:** `backendName` is a user-chosen friendly name for Trident's internal identification (visible in `tridentctl get backend`). It does not reference any external GCP resource. The StorageClass selects this backend via the `selector: "performance=flex"` parameter, which matches the `labels.performance: flex` defined in the `storage` section above.
+
 > **Important:** For Flex zonal pools, `location` must be the **zone** (e.g. `us-central1-a`). For Flex regional pools or Standard/Premium/Extreme, use the **region** (e.g. `us-central1`).
 
 > **Note:** The `storagePools` list is optional. If omitted, Trident will use any pool with the matching service level in the configured location. Explicitly listing pools is only necessary if you want to restrict which pools Trident uses (e.g. when pools in the same project/location are shared across clusters).
@@ -184,19 +181,19 @@ spec:
 Apply both resources:
 
 ```bash
-oc apply -f gcv-backend-flex.yaml
+oc apply -f gcnv-backend-flex.yaml
 ```
 
 Wait for the backend to become ready:
 
 ```bash
-oc get tridentbackendconfig gcv-backend-flex -n trident -o jsonpath='{.status.lastOperationStatus}'
+oc get tridentbackendconfig gcnv-backend-flex -n trident -o jsonpath='{.status.lastOperationStatus}'
 ```
 
 Expected output: `Success`. If it shows `Failed`, check the backend details:
 
 ```bash
-oc describe tridentbackendconfig gcv-backend-flex -n trident
+oc describe tridentbackendconfig gcnv-backend-flex -n trident
 ```
 
 For more examples (virtual pools, SMB, topology), see [GCNV backend configuration examples](https://docs.netapp.com/us-en/trident/trident-use/gcnv-examples.html#example-configurations).
@@ -206,7 +203,7 @@ For more examples (virtual pools, SMB, topology), see [GCNV backend configuratio
 When you need more volume capacity, [create additional storage pools](https://docs.cloud.google.com/netapp/volumes/docs/configure-and-use/storage-pools/create-storage-pool) in GCP and add their names to the `storagePools` list in the TridentBackendConfig:
 
 ```bash
-oc edit tridentbackendconfig gcv-backend-flex -n trident
+oc edit tridentbackendconfig gcnv-backend-flex -n trident
 ```
 
 Add the new pool name to `spec.storagePools` and save. Trident picks up the change automatically.
@@ -385,7 +382,7 @@ oc delete pvc gcnv-test-pvc -n default
 |---|---|---|
 | Namespace | `trident` | Trident operator and controller pods |
 | Secret | `trident-admin` | GCP service account credentials |
-| TridentBackendConfig | `gcv-backend-flex` | Connects Trident to GCNV storage pools |
+| TridentBackendConfig | `gcnv-backend-flex` | Connects Trident to GCNV storage pools |
 | StorageClass | `gcnv-flex` | Default StorageClass for VM disks |
 | VolumeSnapshotClass | `gcnv-csi-snapclass` | Enables VM snapshot/restore |
 | HyperConverged patch | `filesystemOverhead: gcnv-flex: "0.10"` | 10% NFS filesystem overhead for CDI |
@@ -405,7 +402,7 @@ For known errors, quotas, and platform-level constraints, see [gcnv-known-errors
 ## External References
 
 - [NetApp Trident documentation](https://docs.netapp.com/us-en/trident/index.html)
-- [Deploy Trident with the operator](https://docs.netapp.com/us-en/trident/trident-get-started/kubernetes-deploy-operator.html)
+- [Deploy Trident with the operator](https://docs.netapp.com/us-en/trident/trident-install/kubernetes-deploy-operator.html)
 - [GCNV backend preparation](https://docs.netapp.com/us-en/trident/trident-use/gcnv-prep.html)
 - [GCNV backend configuration options and examples](https://docs.netapp.com/us-en/trident/trident-use/gcnv-examples.html)
 - [GCNV quotas and limits](https://docs.cloud.google.com/netapp/volumes/docs/quotas)
