@@ -1,4 +1,4 @@
-# VEP: Hybrid Libvirt Snapshot for Multi-Disk VM Snapshot
+# VEP: Online VMSnapshot Using QEMU External Snapshots
 
 ## Target releases
 
@@ -13,117 +13,124 @@
 - [ ] (R) Beta target version is explicitly mentioned and approved
 - [ ] (R) GA target version is explicitly mentioned and approved
 
----
 
 ## Overview
 
-Refactor the VMSnapshot flow to decouple the guest filesystem freeze from the slow
-CSI VolumeSnapshot creation process. Instead of keeping the VM frozen while individual
-CSI snapshots are taken sequentially, use a QEMU transaction to atomically switch all
-disks to qcow2 overlays in a single sub-millisecond operation, unfreeze the guest
+The current online VMSnapshot flow keeps the VM frozen while CSI snapshots are
+taken, making the freeze duration entirely dependent on CSI driver speed and
+Kubernetes snapshot infrastructure throughput. This VEP introduces a new flow
+that uses a QEMU external snapshot transaction to atomically establish the
+snapshot point at the libvirt level in sub-millisecond time, unfreeze the guest
 immediately, then take CSI VolumeSnapshots of the now-read-only base images
 asynchronously while the VM runs normally. After CSI snapshots are complete,
-block-commit the overlays back into the base images and clean up.
+block-commit the overlays back into the base images and clean up. The existing
+VMSnapshot flow remains unchanged and serves as the default.
 
-This reduces the freeze window from O(N × CSI_latency) to O(1), independent of
-disk count or CSI driver speed.
+This makes the freeze duration independent of CSI driver speed, disk count, or
+Kubernetes API throughput.
 
----
 
 ## Motivation
 
-The current VMSnapshot implementation freezes the guest filesystem and then takes
-CSI VolumeSnapshots — one per disk, serialized by the external-snapshotter sidecar.
-The VM stays frozen the entire time, waiting for the CSI driver to confirm each
-snapshot. This creates two problems:
+The current VMSnapshot implementation freezes the guest filesystem and then creates
+CSI VolumeSnapshots for each of the VM's disks. The VM stays frozen until all
+snapshots have their `CreationTime` set, meaning the freeze duration depends
+entirely on how fast the CSI driver and the Kubernetes snapshot infrastructure
+can process the requests. Even for a single disk, a slow CSI driver can exceed
+acceptable freeze times. For VMs with multiple disks, tuning the
+external-snapshotter's `--kube-api-qps`/`--kube-api-burst`/`--worker-threads` can
+reduce the Kubernetes API throttling overhead, but even with optimal settings the
+bottleneck moves to the CSI driver and storage layer, which KubeVirt has no control
+over. This creates several problems:
 
 ### 1. Windows VSS hard timeout
 
-Windows has a non-configurable 10-second limit on how long the filesystem can be
-held frozen during shadow copy creation. When this limit is exceeded, the VSS
-provider returns [`VSS_E_HOLD_WRITES_TIMEOUT` (0x80042314)](https://support.microsoft.com/en-us/topic/time-out-errors-occur-in-volume-shadow-copy-service-writers-and-shadow-copies-are-lost-during-backup-and-during-times-when-there-are-high-levels-of-input-output-69abf5d3-eadd-9a9a-416a-d1a5752dbef4),
-VSS writers enter Failed state, and the backup is untrustworthy.
-With 6+ disks at ~2 seconds per CSI snapshot, the freeze window easily exceeds
-this limit. This has been reported by users running SQL Server on multi-disk VMs
-migrated from VMware.
-
-The same VMs snapshot successfully on VMware, which uses a similar QEMU
-transaction mechanism internally for quiesced snapshots.
+Windows has a [non-configurable 10-second limit](https://learn.microsoft.com/en-us/windows/win32/vss/overview-of-processing-a-backup-under-vss)
+on how long the filesystem can be held frozen during shadow copy creation. When
+this limit is exceeded, the VSS provider returns
+[`VSS_E_HOLD_WRITES_TIMEOUT` (0x80042314)](https://support.microsoft.com/en-us/topic/time-out-errors-occur-in-volume-shadow-copy-service-writers-and-shadow-copies-are-lost-during-backup-and-during-times-when-there-are-high-levels-of-input-output-69abf5d3-eadd-9a9a-416a-d1a5752dbef4),
+VSS writers enter Failed state, and the snapshot is crash-consistent rather
+than application-consistent. If the CSI
+driver or Kubernetes snapshot infrastructure takes more than 10 seconds to
+process the snapshots, the freeze window exceeds this limit. This has been
+reported by users running SQL Server VMs migrated from VMware, where the
+same VMs snapshot successfully using VMware's own quiesced snapshot mechanism.
 
 ### 2. Long freeze is dangerous on any OS
 
-Even without the Windows 10-second limit, keeping a filesystem frozen for 20+
-seconds is harmful on Linux as well:
+Even without the Windows 10-second limit, keeping a filesystem frozen for
+extended periods is harmful on Linux as well:
 
-- **All write processes block in uninterruptible sleep (D state)** — any process
+- **`fsfreeze` is designed for brief use**: the Linux
+  [`fsfreeze(8)`](https://www.man7.org/linux/man-pages/man8/fsfreeze.8.html)
+  mechanism is intended for the short window needed to take a storage-level
+  snapshot (typically <100ms for LVM/dm snapshots). Holding it for extended
+  periods while waiting for CSI round-trips is far outside the intended use case.
+- **Application disruption**: applications running inside the VM (databases,
+  web servers, ERP systems) experience blocked I/O during the freeze. This
+  can cause client disconnects, replication lag, and service interruptions,
+  especially for latency-sensitive workloads commonly migrated to KubeVirt.
+- **All write processes block in uninterruptible sleep (D state)**: any process
   writing to the frozen filesystem [enters uninterruptible sleep and cannot be
   killed](https://github.com/longhorn/longhorn/wiki/Freezing-File-Systems-With-dmsetup-suspend-Versus-fsfreeze)
-  until thaw. Databases, log writers, journald, cron jobs — all stuck. If the
-  thaw fails or the managing process crashes, those processes [require a full
-  node reboot to recover](https://github.com/longhorn/longhorn/wiki/Freezing-File-Systems-With-dmsetup-suspend-Versus-fsfreeze#the-core-problem).
-- **Database connection timeouts** — most databases have 5-30 second query
-  timeouts. A 20-second freeze causes client disconnects, replication lag, and
-  health check failures (liveness probes fail → pod gets restarted).
-- **Freeze ordering bugs** — the QEMU guest agent [does not always respect the
-  correct freeze order](https://gitlab.com/qemu-project/qemu/-/issues/520) for
-  layered filesystems (loop mounts, dm-crypt). The longer the freeze, the
-  higher the chance of a deadlock → hung task → kernel crash.
-- **`fsfreeze` is designed for milliseconds** — the Linux
-  `fsfreeze(8)`
-  mechanism is intended for the brief window needed to take a storage-level
-  snapshot (typically <100ms for LVM/dm snapshots). Holding it for 20+ seconds
-  while waiting for CSI round-trips is far outside the intended use case.
+  until thaw. In some scenarios, stuck processes [require a full node reboot
+  to recover](https://github.com/longhorn/longhorn/wiki/Freezing-File-Systems-With-dmsetup-suspend-Versus-fsfreeze#the-core-problem).
 
 ### 3. Freeze duration depends on external infrastructure
 
-The freeze duration is entirely determined by how fast the CSI driver can take
-snapshots — something KubeVirt doesn't control. Different CSI drivers have
-different latencies (1-10+ seconds per snapshot), and the external-snapshotter
-sidecar serializes VolumeSnapshot processing regardless of how fast the driver
-is. This makes the freeze window unpredictable and unbounded as disk count
-increases.
+The freeze duration ultimately depends on the CSI driver and storage layer
+speed, which KubeVirt has no control over. Even a single disk can exceed
+the 10-second VSS limit if the CSI driver is slow enough. With multiple
+disks, Kubernetes API throttling in the snapshot infrastructure adds
+additional overhead (tunable via `--kube-api-qps`, `--kube-api-burst`,
+`--worker-threads` on the external-snapshotter), but even with optimal
+tuning the storage layer remains the bottleneck. This makes the freeze
+window unpredictable and fundamentally dependent on external infrastructure.
 
 ### The core design issue
 
 **A snapshot operation should never keep the guest frozen while waiting for
 external infrastructure (CSI drivers, Kubernetes controllers) to respond.**
 The freeze should only last as long as the hypervisor-level snapshot point
-needs to be established — which is sub-millisecond at the QEMU level.
+needs to be established - which is sub-millisecond at the QEMU level.
 
----
 
 ## Goals
 
 - Reduce the VM freeze window during snapshot to sub-second, regardless of
-  disk count or CSI driver speed
-- Make VMSnapshot work reliably for Windows VMs with any number of disks
-- Preserve full backward compatibility — restore from snapshots taken with the
+  CSI driver speed or disk count
+- Make VMSnapshot work reliably for Windows VMs regardless of CSI driver
+  latency or number of disks
+- Preserve full backward compatibility - restore from snapshots taken with the
   new flow must work identically to today
 - VolumeSnapshot CRs produced must be byte-for-byte identical to the current flow
 - No changes to the restore path
 
 ## Non Goals
 
-- Replacing CSI VolumeSnapshots with a different snapshot mechanism — we still
+- Replacing CSI VolumeSnapshots with a different snapshot mechanism - we still
   use CSI VolumeSnapshots for the actual storage-level snapshot
-- VolumeGroupSnapshot support — this is a complementary approach that requires
-  CSI driver support; the hybrid approach works with any CSI driver
-- Offline VM snapshots — this VEP focuses on online (running) VM snapshots
-- Incremental backup integration — CBT/incremental backup is a separate feature
+- VolumeGroupSnapshot support - this is a complementary approach that requires
+  CSI driver support; the QEMU external snapshot approach works with any CSI driver
+- Offline VM snapshots - this VEP focuses on online (running) VM snapshots
+- Incremental backup integration - CBT/incremental backup is a separate feature
   (VEP #25) that coexists with this proposal
+- Backup vendor integration - external backup providers (Velero, Kasten) that
+  manage their own CSI snapshots currently use freeze/unfreeze hooks. Exposing
+  the libvirt-level snapshot to these vendors via a dedicated CRD
+  (e.g. `VirtualMachineSnapshotRequest`) is planned as a follow-up VEP
 
----
 
 ## Definition of Users
 
-- **VM owners** — users who create VMSnapshots of their running VMs, especially
-  Windows VMs with multiple disks
-- **Backup vendors** — Kasten, Velero, and other backup solutions that trigger
+- **VM owners** - users who create VMSnapshots of their running VMs, especially
+  VMs where the CSI driver or disk count causes the freeze to exceed acceptable
+  durations
+- **Backup vendors** - Kasten, Velero, and other backup solutions that trigger
   VMSnapshots or use the freeze/unfreeze subresource API
-- **Cluster administrators** — operators who manage KubeVirt and need to
+- **Cluster administrators** - operators who manage KubeVirt and need to
   understand the new snapshot flow for troubleshooting
 
----
 
 ## User Stories
 
@@ -137,17 +144,16 @@ I want the snapshot freeze window to be as short as possible, so that my
 database connections don't time out and my application doesn't experience
 visible hangs during backup.
 
-### As a backup vendor (Kasten, Velero)
-I want VMSnapshot to work reliably regardless of how many disks the VM has,
-so that I can provide consistent backup SLAs to my users.
+### As a VM owner who snapshots regularly
+I want VMSnapshot to work reliably regardless of how many disks the VM has
+or how fast the CSI driver is, so that I can take snapshots without worrying
+about freeze timeouts or guest application disruption.
 
----
 
 ## Repos
 
 - [kubevirt/kubevirt](https://github.com/kubevirt/kubevirt)
 
----
 
 ## Design
 
@@ -155,23 +161,26 @@ so that I can provide consistent backup SLAs to my users.
 
 ```
 1. Freeze guest filesystem (QEMU guest agent)
-2. Create N VolumeSnapshot CRs — serialized by external-snapshotter (~2s each)
-3. Wait for all CreationTime to be set — VM stays frozen
+2. Create N VolumeSnapshot CRs
+3. Wait for all CreationTime to be set - VM stays frozen
 4. Unfreeze guest filesystem
 ```
 
-Freeze duration: **O(N × CSI_latency)** — 20+ seconds for 10 disks.
+Freeze duration depends on CSI driver speed, Kubernetes snapshot infrastructure
+throughput (`--kube-api-qps`, `--kube-api-burst`, `--worker-threads`), and disk
+count. In testing, this ranged from ~10 seconds (6 disks, fast CSI) to 29+
+seconds (20 disks, Portworx with default throttling).
 
 ### New flow
 
 ```
 Phase 0: Create scratch PVC, hotplug as UtilityVolume
-Phase 1: Freeze → QEMU transaction (all disks, atomic, <5ms) → Unfreeze
+Phase 1: Freeze -> QEMU transaction (all disks, atomic, <5ms) -> Unfreeze
 Phase 2: Create N VolumeSnapshot CRs (VM is unfrozen, no time pressure)
 Phase 3: Block-commit overlays back to base, cleanup scratch volume
 ```
 
-Freeze duration: **O(1)** — <500ms regardless of disk count.
+Freeze duration: **O(1)** - <500ms regardless of disk count.
 
 ### Phase 0: Scratch volume setup
 
@@ -210,7 +219,7 @@ sub-millisecond time. Non-snapshotable disks (cloud-init, ephemeral) are
 marked with `snapshot='no'` in the XML.
 
 After this call:
-- The original disk images (disk.img / block devices) are **read-only** — the
+- The original disk images (disk.img / block devices) are **read-only** - the
   snapshot point
 - New VM writes go to qcow2 overlay files on the scratch volume
 - The VM is unfrozen and running normally
@@ -221,7 +230,7 @@ we call `dom.FSFreeze()` ourselves (same pattern as backup.go).
 
 ### Phase 2: CSI VolumeSnapshots
 
-The snapshot controller creates VolumeSnapshot CRs for each PVC — exactly
+The snapshot controller creates VolumeSnapshot CRs for each PVC - exactly
 the same as today. The only difference is that the VM is **unfrozen** during
 this phase. The CSI snapshots capture the read-only base images, which contain
 the exact frozen-point-in-time data regardless of how long the CSI processing
@@ -236,18 +245,18 @@ for each disk:
 1. **Check state**: Is the disk on overlay? If already on base, skip (idempotent).
    Is there an existing block job? Resume waiting instead of starting a new one.
 2. **Start commit**: [`dom.BlockCommit(disk, "", "", 0, ACTIVE | DELETE)`](https://libvirt.org/kbase/merging_disk_image_chains.html)
-3. **Wait for READY**: Parse domain XML for `<mirror ready='yes'>` attribute —
+3. **Wait for READY**: Parse domain XML for `<mirror ready='yes'>` attribute -
    this is the [only reliable way to detect pivot readiness](https://libvir-list.redhat.narkive.com/KKDmcDw5/libvirt-rfc-exposing-ready-bool-of-query-block-jobs-or-qmp-block-job-ready-event)
    (not `cur == end`, which has a known race condition
    documented across libvirt, Nova, and QEMU bug trackers).
 4. **Pivot**: `dom.BlockJobAbort(disk, PIVOT)` with retry (10x, 200ms backoff).
 5. **Verify**: Read domain XML and confirm the disk source is back on the
-   original base image. If still on overlay, return error — do NOT proceed
+   original base image. If still on overlay, return error - do NOT proceed
    to cleanup.
 
 After ALL disks are committed and verified:
 - Final verification: `verifyAllDisksOnBase()` reads the full domain XML
-  and checks every disk source — the ultimate safety net
+  and checks every disk source - the ultimate safety net
 - Clear the `snapshot.kubevirt.io/overlay-active` annotation on the VMI
 - Detach the utility volume via JSON patch
 - Remove the finalizer from the scratch PVC
@@ -259,27 +268,32 @@ An annotation `snapshot.kubevirt.io/overlay-active` is set on the VMI when
 overlays are active (after Phase 1) and cleared after successful commit
 (after Phase 3). This annotation is checked by:
 
-- **Migration**: blocks `startMigration()` — migration with overlays would
+- **Migration**: blocks `startMigration()` - migration with overlays would
   break the backing chain on the target node
-- **Backup**: blocks `BackupVirtualMachine()` — backup checkpoints on an
+- **Backup**: blocks `BackupVirtualMachine()` - backup checkpoints on an
   overlay become invalid after commit
-- **Volume unplug**: blocks `removeVolumeRequestHandler()` — unplugging a
+- **Volume unplug**: blocks `removeVolumeRequestHandler()` - unplugging a
   disk with an active overlay would orphan the overlay
-- **Disk resize**: skips resize in `syncDisks()` — resizing during overlay
+- **Disk resize**: skips resize in `syncDisks()` - resizing during overlay
   could cause size mismatch between overlay and base
 - **VM destroy**: `KillVMI()` aborts active block jobs before
-  `DestroyFlags()` — prevents orphaned block jobs
+  `DestroyFlags()` - prevents orphaned block jobs
+- **VM crash / pod eviction**: the overlay + base together remain consistent
+  (no data loss). Once the VM comes back up, the pending commit resumes and
+  completes the cleanup. The scratch PVC finalizer ensures it survives across
+  restarts.
 
 ### Block-commit safety
 
 The block-commit (Phase 3) is the most safety-critical part of the design.
 The following mechanisms ensure it cannot leave the VM in a corrupted state:
 
-1. **Correct pivot detection**: Parse domain XML for `<mirror ready='yes'>`
-   instead of polling `cur == end`. Eliminates the race condition that causes
+1. **Correct pivot detection**: Parse domain XML for `<mirror ready='yes'>`.
+   This reflects libvirt's actual internal state after receiving QEMU's
+   `BLOCK_JOB_READY` event, eliminating the known race condition that causes
    premature pivot errors.
 2. **Idempotent and resumable**: Each disk is checked individually. Already
-   committed → skip. Active block job from previous attempt → resume waiting.
+   committed -> skip. Active block job from previous attempt -> resume waiting.
    Safe to call multiple times.
 3. **Post-commit verification**: After each disk AND after all disks, read the
    live domain XML and verify the source path. If any disk is still on overlay,
@@ -288,24 +302,25 @@ The following mechanisms ensure it cannot leave the VM in a corrupted state:
    prevents Kubernetes from garbage-collecting the PVC. Only removed after
    verification passes.
 5. **Never auto-delete on commit failure**: If commit fails, the scratch PVC
-   is preserved, the snapshot is marked with an error, and the controller
-   requeues for retry. The VM keeps running on overlays safely.
+   is preserved and the controller requeues for retry. The CSI-level snapshot
+   itself is valid (the data was captured), but the cleanup/commit phase is
+   marked as incomplete. The VM keeps running on overlays safely until the
+   commit succeeds.
 
 ### Fallback
 
 If `ExternalSnapshot` fails for any reason (no guest agent, libvirt error,
 unsupported configuration), the controller falls back to the current
-sequential CSI path automatically. The hybrid approach is an optimization,
+sequential CSI path automatically. The new flow is an optimization,
 not a requirement.
 
 ### Restore (unchanged)
 
-The VolumeSnapshot CRs produced by the hybrid flow are byte-for-byte identical
-to what the current flow produces — they capture the same disk.img content at
+The VolumeSnapshot CRs produced by the new flow are byte-for-byte identical
+to what the current flow produces - they capture the same disk.img content at
 the same frozen point-in-time. The restore controller creates PVCs from these
 VolumeSnapshots the same way it does today. No changes to the restore path.
 
----
 
 ## API Examples
 
@@ -363,125 +378,150 @@ spec:
       storage: 6Gi
 ```
 
----
 
 ## Alternatives
-
-### VolumeGroupSnapshot
-
-Create a single `VolumeGroupSnapshot` that atomically snapshots all PVCs in one
-CSI call, eliminating the serialization overhead.
-
-**Pros:**
-- No overlays, no block-commit — simpler flow
-- K8s-native API (GA in K8s 1.35)
-
-**Cons:**
-- Requires CSI driver to implement `CreateVolumeGroupSnapshot` RPC — most
-  drivers don't (Portworx only has a proprietary Stork-based alternative,
-  GCE PD doesn't support it at all)
-- Two-party dependency: both KubeVirt AND the CSI driver must implement support
-- Still depends on CSI driver speed for the freeze window (though reduced to
-  a single call)
-
-**Assessment:** Complementary, not alternative. VolumeGroupSnapshot is worth
-supporting when available, but the hybrid approach works with ANY CSI driver.
 
 ### Push-mode backup to separate PVC
 
 Use the libvirt backup API (`virDomainBackupBegin`) in push mode to copy
-consistent disk data to a separate PVC, then take a CSI VolumeSnapshot of
-that PVC.
+consistent disk data to separate target PVCs, then take CSI VolumeSnapshots
+of those target PVCs and attach them to the VMSnapshot. This avoids overlays
+on the live disk chain entirely: no block-commit, no live merge.
+
+There are two variants depending on whether the target PVCs are kept around:
+
+**Ephemeral target PVCs (created per snapshot, deleted after):**
+- Every snapshot requires a full data copy of every disk via QEMU push,
+  since there is no previous state to diff against
+- For large VMs this can be heavy I/O (e.g. 10 disks x 100GB = 1TB copy)
+  and take minutes to hours
+- Target PVCs only exist for the duration of the snapshot operation
+- No permanent storage overhead
+
+**Persistent target PVCs (kept for the lifetime of the VM):**
+- First snapshot requires a full copy, but subsequent snapshots only push
+  the delta using CBT (Changed Block Tracking) dirty bitmaps
+- Subsequent snapshots are fast (only changed blocks are copied)
+- Requires 2x permanent storage: a full-size target PVC per disk, living
+  alongside the original for as long as the VM exists
 
 **Pros:**
-- No overlays on the live disk chain — no block-commit needed
-- No risk of live merge failures
+- No overlays on the live disk chain, no block-commit, no live merge risk
+- With persistent target PVCs + CBT, subsequent snapshots are incremental
+  and fast
 
 **Cons:**
-- Full data copy required — a 10-disk VM with 100GB per disk requires 1TB
-  of data to be copied via QEMU push, taking minutes to hours
-- 2x storage requirement — full-size target PVC per disk
-- Can be optimized with CBT for incremental snapshots (only push delta),
-  but first snapshot is always a full copy
+- Ephemeral: full data copy every time, heavy I/O for large disks
+- Persistent: 2x permanent storage cost per VM
+- Both: additional PVC management complexity (sizing, lifecycle, storage class)
 
-**Assessment:** Valid for environments where the storage cost is acceptable.
-Could be offered as an alternative mode behind a configuration flag. However,
-the performance impact of a full data copy makes it impractical as the default
-for large VMs.
+**Assessment:** Valid for environments where the storage cost (persistent) or
+I/O cost (ephemeral) is acceptable. Could be offered as an alternative mode.
+However, the storage or performance overhead makes it impractical as the
+default for all VMs.
 
----
+### Tuning external-snapshotter parameters
+
+Increase `--kube-api-qps`, `--kube-api-burst`, and `--worker-threads` on
+the external-snapshotter sidecar to reduce Kubernetes API throttling during
+multi-disk snapshot creation.
+
+**Pros:**
+- No code changes in KubeVirt
+- Can meaningfully reduce the freeze window for multi-disk VMs where API
+  throttling is the bottleneck
+
+**Cons:**
+- Only addresses the Kubernetes API overhead, not the CSI driver latency.
+  Once throttling is eliminated, the bottleneck moves to the storage layer
+  which KubeVirt has no control over
+- A single slow CSI driver can still exceed the VSS 10-second limit
+  regardless of tuning
+- Requires cluster-level configuration changes that may not be feasible
+  in all environments
+- Does not solve the fundamental problem: the VM stays frozen while
+  waiting for external infrastructure
+
+**Assessment:** Helpful as a mitigation for multi-disk scenarios, but does
+not eliminate the dependency on CSI driver speed. The freeze duration remains
+unpredictable and externally determined.
+
+### VolumeGroupSnapshot
+
+Create a single `VolumeGroupSnapshot` that atomically snapshots all PVCs in
+one CSI call, ensuring all disks are captured at the same point in time.
+
+**Pros:**
+- No overlays, no block-commit - simpler flow
+- Atomic point-in-time across all disks in a single CSI operation
+- K8s-native API (GA in K8s 1.35)
+
+**Cons:**
+- Still depends on CSI driver speed for the freeze window (though reduced to
+  a single call)
+- Requires both KubeVirt and the CSI driver to implement support - most
+  CSI drivers don't implement the `CreateVolumeGroupSnapshot` RPC yet
+
+**Assessment:** Complementary, not alternative. VolumeGroupSnapshot is worth
+supporting when available, but the QEMU external snapshot approach works with
+any CSI driver.
+
 
 ## Upstream RFE: write-blocking mode for active block-commit
 
-Kevin Wolf from the QEMU team identified a potential convergence issue: under
-heavy I/O, the block-commit sync phase could theoretically not converge because
-the guest writes faster than the commit job copies. QEMU's mirror job already
-supports a `write-blocking` copy mode that guarantees convergence by ensuring
-guest writes are completed on both sides simultaneously. However, this mode is
-currently only exposed for `blockdev-mirror`, not for `block-commit` (which
-internally uses the mirror engine via `commit_active_start()` in
-`block/mirror.c:2198`, but hardcodes `MIRROR_COPY_MODE_BACKGROUND`).
+To make the block-commit sync phase more robust under heavy guest I/O, QEMU's
+mirror engine supports a `write-blocking` copy mode that ensures guest writes
+are completed on both the overlay and the base simultaneously, guaranteeing
+deterministic convergence. This mode is currently available for `blockdev-mirror`
+but not yet exposed for `block-commit`. An RFE has been filed to add this
+support: [RHEL-178640](https://issues.redhat.com/browse/RHEL-178640).
 
-**Needed changes:**
+Once available, this will further strengthen the commit phase for VMs under
+sustained heavy write load.
 
-- **QEMU**: Add `copy-mode` parameter to the `block-commit` QMP command in
-  `qapi/block-core.json`. Pass it through `blockdev.c` to
-  `commit_active_start()` in `block/mirror.c`.
-- **libvirt**: Add `copy-mode` / `syncWrite` parameter to
-  `qemuMonitorJSONBlockCommit()` in `qemu_monitor_json.c`. Expose via a
-  new flag on `virDomainBlockCommit()`.
-- **KubeVirt**: Pass the new flag when calling `BlockCommit()`.
-
-This is a small, mechanical change — the write-blocking mechanism already
-exists in the mirror engine. An RFE should be filed with the QEMU project.
-
-**Note:** In practice, our overlays accumulate minimal data (~10-20 seconds of
-writes) and the sync completes in ~2ms. The write-blocking mode is a defense-in-depth
-measure for extreme I/O workloads, not a requirement for the feature to work.
-
----
 
 ## Scalability
 
 - Scratch PVC size scales with total disk capacity (5% base + write buffer).
   For a VM with 10 × 100GB disks, the default scratch size is ~16Gi.
-- The QEMU transaction is O(1) in wall-clock time regardless of disk count —
+- The QEMU transaction is O(1) in wall-clock time regardless of disk count -
   sub-millisecond for any number of disks.
 - Block-commit time scales linearly with overlay data size, not disk count.
-  With minimal overlays (~MB), commit takes ~2ms per disk.
-- The CSI VolumeSnapshot creation time is unchanged — still serialized by
+  Overlay size depends on guest I/O activity during the CSI snapshot window:
+  mostly idle VMs will have small overlays, while VMs under heavy write load
+  will accumulate more data. In POC testing with light workloads, commit
+  completed in ~2ms per disk.
+- The CSI VolumeSnapshot creation time is unchanged - still serialized by
   the external-snapshotter. But the VM is unfrozen during this phase, so
   the serialization is no longer a problem.
 
----
 
 ## Update/Rollback Compatibility
 
-- The feature is additive — no existing API fields are removed or changed.
+- The feature is additive - no existing API fields are removed or changed.
 - New fields: `spec.overlayScratchSize` on VMSnapshot (optional).
 - New subresources: `externalsnapshot`, `commitsnapshot` on VMI.
 - New annotation: `snapshot.kubevirt.io/overlay-active` on VMI (transient).
 - Rollback: disable the feature gate. VMSnapshot reverts to the current
   sequential CSI path. No data migration needed.
-- Snapshots taken with the hybrid flow are restorable by any version — the
+- Snapshots taken with the new flow are restorable by any version - the
   VolumeSnapshot CRs are standard K8s objects with no KubeVirt-specific
   format changes.
 
----
 
 ## Functional Testing Approach
 
 ### Unit tests
 - Mock VirDomain: verify `CreateSnapshotXML` is called with correct flags
   (`DISK_ONLY | ATOMIC | NO_METADATA`)
-- Mock VirDomain: verify `BlockCommit` → `waitForReady` (XML parsing) →
+- Mock VirDomain: verify `BlockCommit` -> `waitForReady` (XML parsing) ->
   `BlockJobAbort(PIVOT)` sequence
 - Verify `verifyAllDisksOnBase` catches disks still on overlay
 - Verify `filterVMDisks` excludes cloud-init and scratch volume disks
 - Verify `calculateOverlaySize` returns correct sizes
 
 ### Integration tests (kubevirtci)
-- Create a multi-disk VM (6+ disks), take VMSnapshot, verify:
+- Take VMSnapshot with varying disk counts (e.g. 1, 2, 6, 10 disks), verify for each:
   - Scratch PVC created with finalizer
   - Utility volume hotplugged
   - External snapshot taken (all disks on overlays)
@@ -503,7 +543,6 @@ measure for extreme I/O workloads, not a requirement for the feature to work.
 - Kill virt-launcher pod during commit: verify recovery on restart
 - Concurrent snapshot requests: verify only one proceeds (SnapshotInProgress lock)
 
----
 
 ## Implementation Phases
 
@@ -534,16 +573,15 @@ measure for extreme I/O workloads, not a requirement for the feature to work.
 - Crash/recovery testing
 
 ### Phase 5 (future): Upstream QEMU RFE
-- File RFE for `copy-mode` on `block-commit` QMP command
+- [RHEL-178640](https://issues.redhat.com/browse/RHEL-178640): `copy-mode` on `block-commit` QMP command
 - Update libvirt to expose the flag
 - Use write-blocking mode for guaranteed convergence
 
----
 
-## POC Results
+## Early Validation
 
-A working POC (`poc/vmsnapshot-with-libvirt` branch) demonstrated the full
-end-to-end flow on a 6-disk Fedora VM on kubevirtci:
+Initial testing on a 6-disk Fedora VM (kubevirtci) showed the following
+timings for the new flow:
 
 | Phase | Time |
 |-------|------|
@@ -552,18 +590,15 @@ end-to-end flow on a 6-disk Fedora VM on kubevirtci:
 | Block-commit + pivot + verification (6 disks) | **126ms** |
 | Cleanup (detach + delete scratch PVC) | ~30ms |
 
-**VM freeze window: 464ms** — 43x under the Windows VSS 10-second limit.
-Per-disk commit+pivot averages ~2.3ms with XML-based ready detection.
-Tested across 9 consecutive runs with 54 disk commits: zero failures,
-zero pivot retries.
+The freeze window was consistently under 500ms across multiple runs,
+well within the Windows VSS 10-second limit.
 
----
 
 ## Graduation Requirements
 
 ### Alpha
 
-- Feature gated behind `HybridSnapshot` (or similar)
+- Feature gated behind `QEMUExternalSnapshot` (or similar)
 - Core mechanism working: external snapshot + CSI + commit
 - Utility volume lifecycle
 - Edge case guards (migration, backup, unplug, resize)
@@ -585,5 +620,4 @@ zero pivot retries.
 - No regressions in existing snapshot/restore functionality
 - Complete test coverage for all edge cases
 
----
 
